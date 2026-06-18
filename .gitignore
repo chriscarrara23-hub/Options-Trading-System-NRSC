@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+trade_log.json
+trade_log.csv
+scanner_log.json
+backtest_results.json
+ibs_backtest_results.json
+breakout_backtest_results.json
+sensitivity_results.json
