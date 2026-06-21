@@ -24,6 +24,8 @@ from scipy.stats import norm
 warnings.filterwarnings('ignore')
 load_dotenv()
 
+from paper_execution import execute_paper_trade, daily_summary as _paper_daily_summary
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TICKERS           = ['SPY', 'QQQ']
 VIX_LOW           = 15
@@ -406,6 +408,12 @@ def run_scan():
         fed_note = ' | ⚠️ FOMC in 7d' if fed_flag else ''
         earn_note = ' | ⚠️ Earnings in 7d' if earnings_flag else ''
 
+        # Paper trade — only when news risk is not HIGH
+        if news_risk == 'HIGH':
+            exec_note = '⏭️ Paper trade skipped: news risk HIGH'
+        else:
+            exec_note = execute_paper_trade(sig, discord_fn=send_discord)
+
         message = (
             f"{prefix}{ticker} {sig['option']} SIGNAL "
             f"· Score {sig['score']}/4 "
@@ -413,15 +421,33 @@ def run_scan():
             f"· News: {news_risk} — {news_reason}"
             f"{fed_note}{earn_note} "
             f"· Strike: ATM {sig['strike']} Exp {sig['expiry']} "
-            f"· Stop: -45% · Targets: +50% then +100%"
+            f"· Stop: -45% · Targets: +50% then +100% "
+            f"| {exec_note}"
         )
 
         send_discord(message)
         log_entry['alert_sent'] = True
+        log_entry['exec_note']  = exec_note
         log_entry['message']    = message
         print(f'  → Alert sent: {message[:80]}…')
 
         log_scan(log_entry)
+
+
+# ── DAILY SUMMARY (4:05 PM ET, once per day) ─────────────────────────────────
+
+_summary_sent_date = None
+
+def check_daily_summary():
+    """Called every 60 min; fires the EOD summary once after 16:05 ET on weekdays."""
+    global _summary_sent_date
+    now   = datetime.now(ET)
+    today = now.date()
+    if (now.weekday() < 5
+            and now.hour == 16 and now.minute >= 5
+            and _summary_sent_date != today):
+        _summary_sent_date = today
+        _paper_daily_summary(send_discord)
 
 
 # ── TEST MESSAGE ──────────────────────────────────────────────────────────────
@@ -440,9 +466,11 @@ def main():
     print('=' * 60)
 
     schedule.every(60).minutes.do(run_scan)
+    schedule.every(60).minutes.do(check_daily_summary)
 
     # Run immediately on start
     run_scan()
+    check_daily_summary()
 
     while True:
         schedule.run_pending()

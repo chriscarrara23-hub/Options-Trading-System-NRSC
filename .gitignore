@@ -6,6 +6,8 @@ __pycache__/
 trade_log.json
 trade_log.csv
 scanner_log.json
+paper_trades.json
+paper_account_start.json
 backtest_results.json
 ibs_backtest_results.json
 breakout_backtest_results.json
