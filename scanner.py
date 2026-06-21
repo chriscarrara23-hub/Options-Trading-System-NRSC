@@ -24,7 +24,7 @@ from scipy.stats import norm
 warnings.filterwarnings('ignore')
 load_dotenv()
 
-from paper_execution import execute_paper_trade, daily_summary as _paper_daily_summary
+from paper_execution import execute_paper_trade, daily_summary as _paper_daily_summary, monitor_positions
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TICKERS           = ['SPY', 'QQQ']
@@ -361,6 +361,10 @@ def run_scan():
 
     now_str = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
     print(f'\n[{now_str}] Running scan …')
+
+    # Exit monitor runs every cycle regardless of cooldown status.
+    # Cooldown only blocks new entries — it never blocks managing existing positions.
+    monitor_positions(send_discord)
 
     # Cooldown check first (shared across all tickers)
     consec_losses = today_consecutive_losses()

@@ -8,6 +8,7 @@ trade_log.csv
 scanner_log.json
 paper_trades.json
 paper_account_start.json
+position_state.json
 backtest_results.json
 ibs_backtest_results.json
 breakout_backtest_results.json

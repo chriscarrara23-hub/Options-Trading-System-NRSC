@@ -26,10 +26,18 @@ RISK_PER_TRADE_PCT    = 0.025     # 2.5% → $125 at $5k balance
 DRAWDOWN_LIMIT        = 0.10      # block new trades if equity drops >10% from start
 ET                    = pytz.timezone('US/Eastern')
 
-_DIR             = os.path.dirname(os.path.abspath(__file__))
-PAPER_TRADES_LOG = os.path.join(_DIR, 'paper_trades.json')
-PAPER_START_FILE = os.path.join(_DIR, 'paper_account_start.json')
-TRADE_LOG        = os.path.join(_DIR, 'trade_log.json')
+_DIR              = os.path.dirname(os.path.abspath(__file__))
+PAPER_TRADES_LOG  = os.path.join(_DIR, 'paper_trades.json')
+PAPER_START_FILE  = os.path.join(_DIR, 'paper_account_start.json')
+TRADE_LOG         = os.path.join(_DIR, 'trade_log.json')
+POSITION_STATE    = os.path.join(_DIR, 'position_state.json')
+
+# Exit thresholds — must match backtest constants exactly
+STOP_PCT      = -0.45   # close all
+TAKE_HALF_PCT =  0.50   # sell half
+TRAIL_PCT     =  0.25   # close remaining after partial (trail floor)
+FULL_EXIT_PCT =  1.00   # close all remaining
+MAX_HOLD_DAYS =  7      # force-close after this many calendar days
 
 
 # ── ALPACA REST HELPERS ────────────────────────────────────────────────────────
@@ -105,6 +113,23 @@ def close_position(symbol):
     return r.json()
 
 
+# ── POSITION STATE ────────────────────────────────────────────────────────────
+# Persists entry metadata that Alpaca doesn't track: entry date, direction,
+# and whether the partial (+50%) exit has already been taken for each position.
+
+def _load_state() -> dict:
+    try:
+        with open(POSITION_STATE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict):
+    with open(POSITION_STATE, 'w') as f:
+        json.dump(state, f, indent=2, default=str)
+
+
 # ── STARTING EQUITY BASELINE ───────────────────────────────────────────────────
 
 def _load_start_equity():
@@ -134,6 +159,84 @@ def _log(entry):
     log.append(entry)
     with open(PAPER_TRADES_LOG, 'w') as f:
         json.dump(log, f, indent=2, default=str)
+
+
+# ── EXIT ORDER HELPERS ────────────────────────────────────────────────────────
+
+def _exit_all(symbol, exit_type, pnl_pct, dollar_pnl, price, qty, discord_fn):
+    """Close 100% of the remaining position via Alpaca. Returns 'OK' or 'ERROR'."""
+    now_str = datetime.now(ET).isoformat()
+    try:
+        close_position(symbol)
+
+        _EMOJI = {
+            'STOP':        '🛑',
+            'FULL_TARGET': '✅',
+            'TRAIL_STOP':  '🔶',
+            'TIME_EXIT':   '⏱️',
+        }
+        _LABEL = {
+            'STOP':        f'STOP {STOP_PCT*100:.0f}%',
+            'FULL_TARGET': f'FULL EXIT +{FULL_EXIT_PCT*100:.0f}%',
+            'TRAIL_STOP':  f'TRAIL STOP +{TRAIL_PCT*100:.0f}%',
+            'TIME_EXIT':   f'TIME EXIT ({MAX_HOLD_DAYS}d)',
+        }
+        sign = '+' if dollar_pnl >= 0 else ''
+        msg = (f"{_EMOJI.get(exit_type, '📤')} {_LABEL.get(exit_type, exit_type)} "
+               f"| {symbol} | Closed {qty:.4f} shares @ ${price:.2f} "
+               f"| P&L: {sign}${dollar_pnl:.2f} ({sign}{pnl_pct*100:.1f}%)")
+        if discord_fn:
+            discord_fn(msg)
+        _log({'timestamp': now_str, 'ticker': symbol, 'event': exit_type,
+              'qty': qty, 'price': price, 'pnl_pct': round(pnl_pct, 4),
+              'dollar_pnl': round(dollar_pnl, 2), 'status': 'CLOSED'})
+        return 'OK'
+
+    except Exception as e:
+        err = (f'⚠️ EXIT ORDER FAILED | {symbol} | {exit_type} '
+               f'| {e} | Manual close required')
+        if discord_fn:
+            discord_fn(err)
+        _log({'timestamp': now_str, 'ticker': symbol, 'event': f'{exit_type}_FAILED',
+              'error': str(e), 'status': 'ERROR'})
+        return 'ERROR'
+
+
+def _exit_partial(symbol, half_qty, close_side, pnl_pct, dollar_pnl, price, discord_fn):
+    """Sell exactly half_qty shares (partial +50% exit). Returns 'OK' or 'ERROR'."""
+    now_str = datetime.now(ET).isoformat()
+    try:
+        payload = {
+            'symbol':        symbol,
+            'qty':           str(round(half_qty, 4)),
+            'side':          close_side,   # 'sell' for long, 'buy' for short
+            'type':          'market',
+            'time_in_force': 'day',
+        }
+        r = requests.post(f'{PAPER_BASE_URL}/v2/orders',
+                          headers=_headers(), json=payload, timeout=10)
+        r.raise_for_status()
+
+        sign = '+' if dollar_pnl >= 0 else ''
+        msg = (f'🎯 HALF EXIT +{TAKE_HALF_PCT*100:.0f}% | {symbol} '
+               f'| Sold {half_qty:.4f} shares @ ${price:.2f} '
+               f'| {sign}${dollar_pnl:.2f} ({sign}{pnl_pct*100:.1f}%) '
+               f'| Trailing remaining half (floor +{TRAIL_PCT*100:.0f}%)')
+        if discord_fn:
+            discord_fn(msg)
+        _log({'timestamp': now_str, 'ticker': symbol, 'event': 'PARTIAL_EXIT',
+              'qty': half_qty, 'price': price, 'pnl_pct': round(pnl_pct, 4),
+              'dollar_pnl': round(dollar_pnl, 2), 'status': 'PARTIAL_CLOSED'})
+        return 'OK'
+
+    except Exception as e:
+        err = (f'⚠️ PARTIAL EXIT FAILED | {symbol} '
+               f'| {e} | Manual intervention required')
+        if discord_fn:
+            discord_fn(err)
+        _log({'timestamp': now_str, 'ticker': symbol, 'event': 'PARTIAL_EXIT_FAILED',
+              'error': str(e), 'status': 'ERROR'})
+        return 'ERROR'
 
 
 # ── COOLDOWN (reuses trade_log logic) ─────────────────────────────────────────
@@ -219,6 +322,19 @@ def execute_paper_trade(sig, discord_fn=None):
             'status':     'SUBMITTED',
         })
 
+        # Write entry metadata for exit monitor — Alpaca doesn't track entry
+        # date or partial-exit state, so we persist it ourselves.
+        state = _load_state()
+        state[ticker] = {
+            'entry_date':    str(date.today()),
+            'entry_price':   sig['close'],
+            'direction':     direction,
+            'side':          side,
+            'partial_taken': False,
+            'order_id':      order.get('id'),
+        }
+        _save_state(state)
+
         action = 'bought' if side == 'buy' else 'shorted'
         return f'🤖 Paper trade executed: {action} ~{est_shares:.4f} shares (${dollar_risk:.0f})'
 
@@ -226,6 +342,98 @@ def execute_paper_trade(sig, discord_fn=None):
         _log({'timestamp': now_str, 'ticker': ticker, 'direction': direction,
               'status': 'ERROR', 'reason': str(e)})
         return f'⚠️ Paper execution error: {e}'
+
+
+# ── POSITION MONITOR ──────────────────────────────────────────────────────────
+
+def monitor_positions(discord_fn=None):
+    """
+    Called on every hourly scan (inside market hours).
+    Checks every tracked position against all five exit conditions in priority
+    order and places the appropriate Alpaca order automatically.
+
+    Exit priority (highest to lowest):
+      1. Stop loss      : unrealized P&L ≤ -45%  → close ALL remaining
+      2. Full target    : unrealized P&L ≥ +100% → close ALL remaining
+      3. Trail stop     : partial already taken AND P&L ≤ +25% → close ALL remaining
+      4. Partial exit   : unrealized P&L ≥ +50%, partial NOT yet taken → sell HALF
+      5. Time exit      : calendar days since entry ≥ 7 → close ALL remaining
+
+    If two conditions are simultaneously true (e.g. price past +100% on day 7),
+    the higher-priority condition fires and the lower one is skipped — no
+    double-execution is possible because each branch is an elif.
+    """
+    state = _load_state()
+    if not state:
+        return
+
+    today     = date.today()
+    now_str   = datetime.now(ET).isoformat()
+    to_remove = []
+
+    for ticker, entry in list(state.items()):
+        pos = get_position(ticker)
+
+        # Position missing from Alpaca — closed manually or order never filled
+        if pos is None:
+            to_remove.append(ticker)
+            msg = (f'⚠️ {ticker} position not found in Alpaca '
+                   f'— removed from tracking (closed manually or order lapsed)')
+            if discord_fn:
+                discord_fn(msg)
+            _log({'timestamp': now_str, 'ticker': ticker,
+                  'event': 'POSITION_NOT_FOUND', 'status': 'REMOVED'})
+            continue
+
+        pnl_pct     = float(pos['unrealized_plpc'])   # e.g. 0.50 = +50%
+        dollar_pnl  = float(pos['unrealized_pl'])
+        qty         = float(pos['qty'])
+        price       = float(pos['current_price'])
+        alpaca_side = pos['side']                      # 'long' or 'short'
+        close_side  = 'sell' if alpaca_side == 'long' else 'buy'
+
+        entry_date    = date.fromisoformat(entry['entry_date'])
+        days_held     = (today - entry_date).days
+        partial_taken = entry.get('partial_taken', False)
+
+        # ── Priority 1: Stop loss ─────────────────────────────────────────────
+        if pnl_pct <= STOP_PCT:
+            result = _exit_all(ticker, 'STOP', pnl_pct, dollar_pnl, price, qty, discord_fn)
+            if result == 'OK':
+                to_remove.append(ticker)
+
+        # ── Priority 2: Full target ───────────────────────────────────────────
+        elif pnl_pct >= FULL_EXIT_PCT:
+            result = _exit_all(ticker, 'FULL_TARGET', pnl_pct, dollar_pnl, price, qty, discord_fn)
+            if result == 'OK':
+                to_remove.append(ticker)
+
+        # ── Priority 3: Trail stop (only active after partial taken) ──────────
+        elif partial_taken and pnl_pct <= TRAIL_PCT:
+            result = _exit_all(ticker, 'TRAIL_STOP', pnl_pct, dollar_pnl, price, qty, discord_fn)
+            if result == 'OK':
+                to_remove.append(ticker)
+
+        # ── Priority 4: Partial exit (+50%, first time only) ─────────────────
+        elif pnl_pct >= TAKE_HALF_PCT and not partial_taken:
+            half_qty    = round(qty / 2, 4)
+            half_dollar = dollar_pnl / 2
+            result = _exit_partial(ticker, half_qty, close_side,
+                                   pnl_pct, half_dollar, price, discord_fn)
+            if result == 'OK':
+                entry['partial_taken'] = True
+                state[ticker] = entry    # update in-memory state before saving
+
+        # ── Priority 5: Time exit (7-day force-close) ─────────────────────────
+        elif days_held >= MAX_HOLD_DAYS:
+            result = _exit_all(ticker, 'TIME_EXIT', pnl_pct, dollar_pnl, price, qty, discord_fn)
+            if result == 'OK':
+                to_remove.append(ticker)
+
+    # Remove fully-closed positions from state
+    for ticker in to_remove:
+        state.pop(ticker, None)
+    _save_state(state)
 
 
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
