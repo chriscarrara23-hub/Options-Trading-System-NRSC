@@ -24,7 +24,8 @@ from scipy.stats import norm
 warnings.filterwarnings('ignore')
 load_dotenv()
 
-from paper_execution import execute_paper_trade, daily_summary as _paper_daily_summary, monitor_positions
+from paper_execution import (execute_paper_trade, daily_summary as _paper_daily_summary,
+                             monitor_positions, reconcile_positions_on_startup)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TICKERS           = ['SPY', 'QQQ']
@@ -312,11 +313,22 @@ def send_discord(message):
     if not DISCORD_WEBHOOK:
         print(f'[Discord] {message}')
         return
-    try:
-        r = requests.post(DISCORD_WEBHOOK, json={'content': message}, timeout=10)
-        r.raise_for_status()
-    except Exception as e:
-        print(f'Discord error: {e}')
+    for attempt in range(3):
+        try:
+            r = requests.post(DISCORD_WEBHOOK, json={'content': message}, timeout=10)
+            if r.status_code == 429:
+                # Discord rate limit — honour retry_after before next attempt
+                wait = float((r.json() if r.content else {}).get('retry_after', 1.0))
+                print(f'Discord 429 rate-limit, retrying in {wait:.1f}s (attempt {attempt + 1}/3) …')
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return   # delivered
+        except Exception as e:
+            print(f'Discord error (attempt {attempt + 1}/3): {e}')
+            if attempt < 2:
+                time.sleep(1)
+    print(f'Discord: gave up after 3 attempts — message: {message[:80]}…')
 
 
 # ── COOLDOWN CHECK ────────────────────────────────────────────────────────────
@@ -468,6 +480,10 @@ def main():
     print('  OPTIONS SCANNER  |  SPY + QQQ')
     print('  Runs every 60 min, 9:30–16:00 ET, Mon–Fri')
     print('=' * 60)
+
+    # Reconcile open Alpaca positions against state file before anything else.
+    # Guards against ephemeral filesystem loss on Railway redeploy.
+    reconcile_positions_on_startup(send_discord)
 
     schedule.every(60).minutes.do(run_scan)
     schedule.every(60).minutes.do(check_daily_summary)

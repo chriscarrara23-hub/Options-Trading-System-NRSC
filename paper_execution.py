@@ -113,6 +113,14 @@ def close_position(symbol):
     return r.json()
 
 
+def get_all_positions():
+    """Return list of all open Alpaca positions (empty list if none)."""
+    r = requests.get(f'{PAPER_BASE_URL}/v2/positions',
+                     headers=_headers(), timeout=10)
+    r.raise_for_status()
+    return r.json()  # list of position dicts
+
+
 # ── POSITION STATE ────────────────────────────────────────────────────────────
 # Persists entry metadata that Alpaca doesn't track: entry date, direction,
 # and whether the partial (+50%) exit has already been taken for each position.
@@ -434,6 +442,72 @@ def monitor_positions(discord_fn=None):
     for ticker in to_remove:
         state.pop(ticker, None)
     _save_state(state)
+
+
+# ── STARTUP RECONCILIATION ────────────────────────────────────────────────────
+
+def reconcile_positions_on_startup(discord_fn=None):
+    """
+    Call once in main() before the scheduler loop starts.
+
+    Fetches every open position from Alpaca and creates a conservative
+    state entry for any that are not already in position_state.json.
+    This guards against the ephemeral Railway filesystem wiping state on
+    redeploy while a position remains open.
+
+    Conservative defaults for adopted positions:
+      entry_date    = today  (7-day timer resets — safe, not dangerous)
+      entry_price   = Alpaca's avg_entry_price (correct cost basis)
+      partial_taken = False  (may re-trigger a partial if price is still
+                              above +50%, but won't double-close since the
+                              monitor uses Alpaca's live qty each cycle)
+      reconciled    = True   (audit flag so you can see in paper_trades.json)
+    """
+    try:
+        alpaca_positions = get_all_positions()
+        state            = _load_state()
+        adopted          = []
+
+        for pos in alpaca_positions:
+            symbol = pos['symbol']
+            if symbol in state:
+                continue  # already tracked — leave existing state untouched
+
+            alpaca_side = pos['side']                       # 'long' or 'short'
+            entry_price = float(
+                pos.get('avg_entry_price') or pos.get('current_price', 0)
+            )
+
+            state[symbol] = {
+                'entry_date':    str(date.today()),
+                'entry_price':   entry_price,
+                'direction':     'bullish' if alpaca_side == 'long' else 'bearish',
+                'side':          'buy'     if alpaca_side == 'long' else 'sell',
+                'partial_taken': False,
+                'order_id':      None,
+                'reconciled':    True,
+            }
+            adopted.append(symbol)
+
+        if adopted:
+            _save_state(state)
+            msg = (
+                f'🔄 Startup reconciliation: {len(adopted)} orphaned position(s) '
+                f'adopted from Alpaca — {", ".join(adopted)}.\n'
+                f'entry_date reset to today; partial_taken=False. '
+                f'Verify manually if a partial exit was already taken before restart.'
+            )
+            if discord_fn:
+                discord_fn(msg)
+            print(f'[reconcile] Adopted: {adopted}')
+        else:
+            tracked = len(state)
+            open_n  = len(alpaca_positions)
+            print(f'[reconcile] OK — {tracked} tracked / {open_n} open in Alpaca')
+
+    except Exception as e:
+        # Never let reconciliation failure prevent the scanner from starting
+        print(f'[reconcile] Error (scanner will start anyway): {e}')
 
 
 # ── DAILY SUMMARY ─────────────────────────────────────────────────────────────
