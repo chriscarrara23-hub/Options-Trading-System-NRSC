@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
 Paper trading execution — Alpaca PAPER API only.
-
-Base URL is hard-coded to paper-api.alpaca.markets.
-This module never references the live trading endpoint.
+Trades real options contracts (long calls for bullish, long puts for bearish).
+Base URL is hard-coded to paper-api.alpaca.markets — never changed.
 """
 
 import json
 import os
-import time
-from datetime import date, datetime
+import re
+from datetime import date, datetime, timedelta
 
 import pytz
 import requests
@@ -18,26 +17,37 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
-PAPER_BASE_URL        = 'https://paper-api.alpaca.markets'   # PAPER only
-ALPACA_KEY            = os.getenv('ALPACA_KEY')
-ALPACA_SECRET         = os.getenv('ALPACA_SECRET')
-PAPER_ACCOUNT_BALANCE = 5_000.0   # change this to rescale position sizes
-RISK_PER_TRADE_PCT    = 0.025     # 2.5% → $125 at $5k balance
-DRAWDOWN_LIMIT        = 0.10      # block new trades if equity drops >10% from start
-ET                    = pytz.timezone('US/Eastern')
+PAPER_BASE_URL    = 'https://paper-api.alpaca.markets'  # PAPER only
+ALPACA_KEY        = os.getenv('ALPACA_KEY')
+ALPACA_SECRET     = os.getenv('ALPACA_SECRET')
+ET                = pytz.timezone('US/Eastern')
 
-_DIR              = os.path.dirname(os.path.abspath(__file__))
-PAPER_TRADES_LOG  = os.path.join(_DIR, 'paper_trades.json')
-PAPER_START_FILE  = os.path.join(_DIR, 'paper_account_start.json')
-TRADE_LOG         = os.path.join(_DIR, 'trade_log.json')
-POSITION_STATE    = os.path.join(_DIR, 'position_state.json')
+# Size trades as if managing a $5k real account (2.5% = $125 risk budget).
+# The paper account's $100k buying power absorbs orders without rejection.
+SIMULATED_ACCOUNT  = 5_000.0
+RISK_PER_TRADE_PCT = 0.025
+RISK_BUDGET        = SIMULATED_ACCOUNT * RISK_PER_TRADE_PCT   # $125
+DRAWDOWN_LIMIT     = 0.10
 
-# Exit thresholds — must match backtest constants exactly
-STOP_PCT      = -0.45   # close all
-TAKE_HALF_PCT =  0.50   # sell half
-TRAIL_PCT     =  0.25   # close remaining after partial (trail floor)
-FULL_EXIT_PCT =  1.00   # close all remaining
-MAX_HOLD_DAYS =  7      # force-close after this many calendar days
+# Contract selection
+TARGET_DTE        = 7
+MIN_DTE           = 4
+MAX_DTE           = 8
+MIN_CONTRACT_COST = 75     # 0.6× budget floor — avoids deep junk OTM
+MAX_CONTRACT_COST = 250    # 2.0× budget cap   — catches QQQ far-OTM when affordable
+
+# Exit thresholds (match backtest constants)
+STOP_PCT         = -0.45
+TAKE_HALF_PCT    =  0.50   # partial snapshot trigger (no actual sell — only 1 contract)
+FULL_EXIT_PCT    =  1.00
+BREAKEVEN_STOP   =  0.00   # trail floor after partial snapshot
+OPTIONS_MAX_HOLD =  6      # day-6 time exit before Alpaca expiry-day risk mgmt at 3:30pm
+
+_DIR             = os.path.dirname(os.path.abspath(__file__))
+PAPER_TRADES_LOG = os.path.join(_DIR, 'paper_trades.json')
+PAPER_START_FILE = os.path.join(_DIR, 'paper_account_start.json')
+TRADE_LOG        = os.path.join(_DIR, 'trade_log.json')
+POSITION_STATE   = os.path.join(_DIR, 'position_state.json')
 
 
 # ── ALPACA REST HELPERS ────────────────────────────────────────────────────────
@@ -57,7 +67,7 @@ def get_account():
 
 
 def get_position(symbol):
-    """Return open position dict or None."""
+    """Return open position dict for any symbol (equity or OCC option) or None."""
     try:
         r = requests.get(f'{PAPER_BASE_URL}/v2/positions/{symbol}',
                          headers=_headers(), timeout=10)
@@ -69,61 +79,127 @@ def get_position(symbol):
         return None
 
 
-def _place_notional_order(symbol, side, notional):
-    """Market day order sized by dollar notional."""
-    payload = {
-        'symbol':        symbol,
-        'notional':      str(round(notional, 2)),
-        'side':          side,
-        'type':          'market',
-        'time_in_force': 'day',
-    }
-    r = requests.post(f'{PAPER_BASE_URL}/v2/orders',
-                      headers=_headers(), json=payload, timeout=10)
-    r.raise_for_status()
-    return r.json()
-
-
-def _place_qty_order(symbol, side, qty):
-    """Market day order for an exact share count (used for test only)."""
-    payload = {
-        'symbol':        symbol,
-        'qty':           str(qty),
-        'side':          side,
-        'type':          'market',
-        'time_in_force': 'day',
-    }
-    r = requests.post(f'{PAPER_BASE_URL}/v2/orders',
-                      headers=_headers(), json=payload, timeout=10)
-    r.raise_for_status()
-    return r.json()
-
-
-def _cancel_order(order_id):
-    r = requests.delete(f'{PAPER_BASE_URL}/v2/orders/{order_id}',
-                        headers=_headers(), timeout=10)
-    return r.status_code in (200, 204)
-
-
-def close_position(symbol):
-    """Market order to close all shares of a position."""
-    r = requests.delete(f'{PAPER_BASE_URL}/v2/positions/{symbol}',
-                        headers=_headers(), timeout=10)
-    r.raise_for_status()
-    return r.json()
-
-
 def get_all_positions():
-    """Return list of all open Alpaca positions (empty list if none)."""
-    r = requests.get(f'{PAPER_BASE_URL}/v2/positions',
-                     headers=_headers(), timeout=10)
+    """Return list of all open Alpaca positions (shares + options)."""
+    r = requests.get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers(), timeout=10)
     r.raise_for_status()
-    return r.json()  # list of position dicts
+    return r.json()
 
 
-# ── POSITION STATE ────────────────────────────────────────────────────────────
-# Persists entry metadata that Alpaca doesn't track: entry date, direction,
-# and whether the partial (+50%) exit has already been taken for each position.
+def _sell_option(option_symbol, qty=1):
+    """Place a market sell-to-close order for a long options position."""
+    payload = {
+        'symbol':        option_symbol,
+        'qty':           str(qty),
+        'side':          'sell',
+        'type':          'market',
+        'time_in_force': 'day',
+    }
+    r = requests.post(f'{PAPER_BASE_URL}/v2/orders',
+                      headers=_headers(), json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+# ── OCC SYMBOL PARSER ─────────────────────────────────────────────────────────
+
+_OCC_RE = re.compile(r'^([A-Z]+)(\d{2})(\d{2})(\d{2})([CP])(\d{8})$')
+
+
+def _parse_occ(symbol):
+    """Parse OCC option symbol. Returns dict with underlying/type/strike/expiration or None."""
+    m = _OCC_RE.match(symbol)
+    if not m:
+        return None
+    yy, mm, dd = m.group(2), m.group(3), m.group(4)
+    return {
+        'underlying':  m.group(1),
+        'option_type': 'call' if m.group(5) == 'C' else 'put',
+        'strike':      int(m.group(6)) / 1000,
+        'expiration':  f'20{yy}-{mm}-{dd}',
+    }
+
+
+# ── CONTRACT SELECTION ─────────────────────────────────────────────────────────
+
+def select_contract(ticker, direction, current_price):
+    """
+    Fetch the live Alpaca options chain and return the best contract for this signal.
+
+    Selection rules:
+      1. Expiration closest to 7 DTE within the 4–8 DTE window.
+      2. Strike where 1-contract cost (premium × 100) is $75–$200.
+      3. Among affordable strikes, prefer the one closest to ATM.
+
+    Returns a dict {symbol, strike, expiry, premium, cost, dte, atm_diff} or None.
+    """
+    option_type = 'call' if direction == 'bullish' else 'put'
+    today       = date.today()
+
+    params = {
+        'underlying_symbols':  ticker,
+        'expiration_date_gte': str(today + timedelta(days=MIN_DTE)),
+        'expiration_date_lte': str(today + timedelta(days=MAX_DTE + 2)),
+        'type':                option_type,
+        'limit':               500,
+    }
+    r = requests.get(f'{PAPER_BASE_URL}/v2/options/contracts',
+                     headers=_headers(), params=params, timeout=10)
+    r.raise_for_status()
+    contracts = r.json().get('option_contracts', [])
+
+    if not contracts:
+        return None
+
+    # Build map of expiration → DTE, keep only those in the 4–8 DTE window
+    valid_exps = {}
+    for c in contracts:
+        dte = (date.fromisoformat(c['expiration_date']) - today).days
+        if MIN_DTE <= dte <= MAX_DTE:
+            valid_exps[c['expiration_date']] = dte
+
+    if not valid_exps:
+        return None
+
+    # Pick expiration closest to TARGET_DTE; break ties in favour of longer DTE
+    best_exp = min(valid_exps, key=lambda e: (abs(valid_exps[e] - TARGET_DTE), -valid_exps[e]))
+
+    # Score candidates at this expiration
+    candidates = []
+    for c in contracts:
+        if c['expiration_date'] != best_exp:
+            continue
+        raw = c.get('close_price')
+        if not raw:
+            continue
+        try:
+            premium = float(raw)
+        except (ValueError, TypeError):
+            continue
+        if premium <= 0:
+            continue
+
+        strike = float(c['strike_price'])
+        cost   = premium * 100
+        if MIN_CONTRACT_COST <= cost <= MAX_CONTRACT_COST:
+            candidates.append({
+                'symbol':   c['symbol'],
+                'strike':   strike,
+                'premium':  premium,
+                'cost':     cost,
+                'dte':      valid_exps[best_exp],
+                'expiry':   best_exp,
+                'atm_diff': abs(strike - current_price),
+            })
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x['atm_diff'])
+    return candidates[0]
+
+
+# ── POSITION STATE ─────────────────────────────────────────────────────────────
 
 def _load_state() -> dict:
     try:
@@ -141,7 +217,6 @@ def _save_state(state: dict):
 # ── STARTING EQUITY BASELINE ───────────────────────────────────────────────────
 
 def _load_start_equity():
-    """Return starting equity; initialise from live account on first call."""
     try:
         with open(PAPER_START_FILE) as f:
             return float(json.load(f)['start_equity'])
@@ -149,10 +224,7 @@ def _load_start_equity():
         acct   = get_account()
         equity = float(acct['equity'])
         with open(PAPER_START_FILE, 'w') as f:
-            json.dump({
-                'start_equity': equity,
-                'recorded_at':  datetime.now().isoformat(),
-            }, f, indent=2)
+            json.dump({'start_equity': equity, 'recorded_at': datetime.now().isoformat()}, f, indent=2)
         return equity
 
 
@@ -169,85 +241,7 @@ def _log(entry):
         json.dump(log, f, indent=2, default=str)
 
 
-# ── EXIT ORDER HELPERS ────────────────────────────────────────────────────────
-
-def _exit_all(symbol, exit_type, pnl_pct, dollar_pnl, price, qty, discord_fn):
-    """Close 100% of the remaining position via Alpaca. Returns 'OK' or 'ERROR'."""
-    now_str = datetime.now(ET).isoformat()
-    try:
-        close_position(symbol)
-
-        _EMOJI = {
-            'STOP':        '🛑',
-            'FULL_TARGET': '✅',
-            'TRAIL_STOP':  '🔶',
-            'TIME_EXIT':   '⏱️',
-        }
-        _LABEL = {
-            'STOP':        f'STOP {STOP_PCT*100:.0f}%',
-            'FULL_TARGET': f'FULL EXIT +{FULL_EXIT_PCT*100:.0f}%',
-            'TRAIL_STOP':  f'TRAIL STOP +{TRAIL_PCT*100:.0f}%',
-            'TIME_EXIT':   f'TIME EXIT ({MAX_HOLD_DAYS}d)',
-        }
-        sign = '+' if dollar_pnl >= 0 else ''
-        msg = (f"{_EMOJI.get(exit_type, '📤')} {_LABEL.get(exit_type, exit_type)} "
-               f"| {symbol} | Closed {qty:.4f} shares @ ${price:.2f} "
-               f"| P&L: {sign}${dollar_pnl:.2f} ({sign}{pnl_pct*100:.1f}%)")
-        if discord_fn:
-            discord_fn(msg)
-        _log({'timestamp': now_str, 'ticker': symbol, 'event': exit_type,
-              'qty': qty, 'price': price, 'pnl_pct': round(pnl_pct, 4),
-              'dollar_pnl': round(dollar_pnl, 2), 'status': 'CLOSED'})
-        return 'OK'
-
-    except Exception as e:
-        err = (f'⚠️ EXIT ORDER FAILED | {symbol} | {exit_type} '
-               f'| {e} | Manual close required')
-        if discord_fn:
-            discord_fn(err)
-        _log({'timestamp': now_str, 'ticker': symbol, 'event': f'{exit_type}_FAILED',
-              'error': str(e), 'status': 'ERROR'})
-        return 'ERROR'
-
-
-def _exit_partial(symbol, half_qty, close_side, pnl_pct, dollar_pnl, price, discord_fn):
-    """Sell exactly half_qty shares (partial +50% exit). Returns 'OK' or 'ERROR'."""
-    now_str = datetime.now(ET).isoformat()
-    try:
-        payload = {
-            'symbol':        symbol,
-            'qty':           str(round(half_qty, 4)),
-            'side':          close_side,   # 'sell' for long, 'buy' for short
-            'type':          'market',
-            'time_in_force': 'day',
-        }
-        r = requests.post(f'{PAPER_BASE_URL}/v2/orders',
-                          headers=_headers(), json=payload, timeout=10)
-        r.raise_for_status()
-
-        sign = '+' if dollar_pnl >= 0 else ''
-        msg = (f'🎯 HALF EXIT +{TAKE_HALF_PCT*100:.0f}% | {symbol} '
-               f'| Sold {half_qty:.4f} shares @ ${price:.2f} '
-               f'| {sign}${dollar_pnl:.2f} ({sign}{pnl_pct*100:.1f}%) '
-               f'| Trailing remaining half (floor +{TRAIL_PCT*100:.0f}%)')
-        if discord_fn:
-            discord_fn(msg)
-        _log({'timestamp': now_str, 'ticker': symbol, 'event': 'PARTIAL_EXIT',
-              'qty': half_qty, 'price': price, 'pnl_pct': round(pnl_pct, 4),
-              'dollar_pnl': round(dollar_pnl, 2), 'status': 'PARTIAL_CLOSED'})
-        return 'OK'
-
-    except Exception as e:
-        err = (f'⚠️ PARTIAL EXIT FAILED | {symbol} '
-               f'| {e} | Manual intervention required')
-        if discord_fn:
-            discord_fn(err)
-        _log({'timestamp': now_str, 'ticker': symbol, 'event': 'PARTIAL_EXIT_FAILED',
-              'error': str(e), 'status': 'ERROR'})
-        return 'ERROR'
-
-
-# ── COOLDOWN (reuses trade_log logic) ─────────────────────────────────────────
+# ── COOLDOWN ──────────────────────────────────────────────────────────────────
 
 def _today_consecutive_losses():
     try:
@@ -265,16 +259,77 @@ def _today_consecutive_losses():
         return 0
 
 
+# ── EXIT HELPER ───────────────────────────────────────────────────────────────
+
+_EXIT_EMOJI = {
+    'STOP':        '🔴',
+    'FULL_TARGET': '✅',
+    'TRAIL_STOP':  '🔶',
+    'TIME_EXIT':   '⏰',
+}
+
+_EXIT_LABEL = {
+    'STOP':        f'STOP {STOP_PCT*100:.0f}%',
+    'FULL_TARGET': f'FULL EXIT +{FULL_EXIT_PCT*100:.0f}%',
+    'TRAIL_STOP':  'TRAIL STOP (breakeven)',
+    'TIME_EXIT':   f'TIME EXIT (day {OPTIONS_MAX_HOLD})',
+}
+
+
+def _exit_option(option_symbol, exit_type, entry_premium, pos, discord_fn):
+    """
+    Market sell-to-close the options position. pos is the live Alpaca position dict.
+    Returns 'OK' or 'ERROR'.
+    """
+    now_str         = datetime.now(ET).isoformat()
+    current_premium = float(pos['current_price'])
+    dollar_pnl      = float(pos['unrealized_pl'])
+    pnl_pct         = float(pos['unrealized_plpc'])
+    sign            = '+' if dollar_pnl >= 0 else ''
+
+    try:
+        _sell_option(option_symbol)
+
+        msg = (
+            f"{_EXIT_EMOJI.get(exit_type, '📤')} {_EXIT_LABEL.get(exit_type, exit_type)} "
+            f"| {option_symbol} "
+            f"| Entry ${entry_premium:.2f} → Exit ${current_premium:.2f} "
+            f"| P&L: {sign}${dollar_pnl:.2f} ({sign}{pnl_pct*100:.1f}%)"
+        )
+        if discord_fn:
+            discord_fn(msg)
+
+        _log({
+            'timestamp':     now_str,
+            'symbol':        option_symbol,
+            'event':         exit_type,
+            'entry_premium': entry_premium,
+            'exit_premium':  current_premium,
+            'dollar_pnl':    round(dollar_pnl, 2),
+            'pnl_pct':       round(pnl_pct, 4),
+            'status':        'CLOSED',
+        })
+        return 'OK'
+
+    except Exception as e:
+        err = (f'⚠️ EXIT ORDER FAILED | {option_symbol} | {exit_type} '
+               f'| {e} | Manual close required')
+        if discord_fn:
+            discord_fn(err)
+        _log({'timestamp': now_str, 'symbol': option_symbol,
+              'event': f'{exit_type}_FAILED', 'error': str(e), 'status': 'ERROR'})
+        return 'ERROR'
+
+
 # ── MAIN EXECUTION ENTRY POINT ────────────────────────────────────────────────
 
 def execute_paper_trade(sig, discord_fn=None):
     """
-    Attempt to paper-trade a signal returned by scanner.evaluate_signal().
-    Returns a one-line string to append to the Discord alert.
+    Attempt to enter a paper options trade for a scanner signal.
+    Returns a one-line string appended to the Discord alert in scanner.py.
     """
     ticker    = sig['ticker']
     direction = sig['direction']
-    side      = 'buy' if direction == 'bullish' else 'sell'
     now_str   = datetime.now(ET).isoformat()
 
     def _skip(reason):
@@ -288,63 +343,91 @@ def execute_paper_trade(sig, discord_fn=None):
         return f'🚫 Paper trade blocked: {reason}'
 
     try:
-        # 1. Same-day cooldown
+        # 1. Cooldown
         if _today_consecutive_losses() >= 3:
             return _skip('3 consecutive losses today — cooldown active')
 
-        # 2. Account health
+        # 2. Entry guard: no doubling into the same underlying
+        state = _load_state()
+        if any(e.get('underlying') == ticker for e in state.values()):
+            return _skip(f'position already open in {ticker}')
+
+        # 3. Account health vs paper equity
         acct         = get_account()
         equity       = float(acct['equity'])
         start_equity = _load_start_equity()
         if equity < start_equity * (1 - DRAWDOWN_LIMIT):
             msg = (f'📉 Paper account down >10% from start '
-                   f'(${start_equity:,.0f} → ${equity:,.0f}) — '
-                   f'trading paused, review needed.')
+                   f'(${start_equity:,.0f} → ${equity:,.0f}) — trading paused.')
             if discord_fn:
                 discord_fn(msg)
             return _block(f'equity ${equity:.2f} below 90% of start ${start_equity:.2f}')
 
-        # 3. No adding to existing positions
-        pos = get_position(ticker)
-        if pos is not None:
-            return _skip(f'position already open ({pos.get("qty", "?")} shares)')
+        # 4. Select contract from live chain
+        contract = select_contract(ticker, direction, sig['close'])
+        if contract is None:
+            # Skip logged to paper_trades.json; reason appears in scanner signal alert
+            return _skip(f'no contract in ${MIN_CONTRACT_COST}–${MAX_CONTRACT_COST} range')
 
-        # 4. Shorting availability for bearish signals
-        if side == 'sell' and not acct.get('shorting_enabled', True):
-            return _skip('shorting not enabled on this paper account')
+        option_symbol = contract['symbol']
+        premium       = contract['premium']
+        strike        = contract['strike']
+        expiry        = contract['expiry']
+        cost          = contract['cost']
 
-        # 5. Size and submit
-        dollar_risk = PAPER_ACCOUNT_BALANCE * RISK_PER_TRADE_PCT
-        order       = _place_notional_order(ticker, side, dollar_risk)
-        est_shares  = round(dollar_risk / sig['close'], 4)
+        # 5. Place buy-to-open order (always long — calls for bullish, puts for bearish)
+        payload = {
+            'symbol':        option_symbol,
+            'qty':           '1',
+            'side':          'buy',
+            'type':          'market',
+            'time_in_force': 'day',
+        }
+        r = requests.post(f'{PAPER_BASE_URL}/v2/orders',
+                          headers=_headers(), json=payload, timeout=10)
+        r.raise_for_status()
+        order = r.json()
 
-        _log({
-            'timestamp':  now_str,
-            'ticker':     ticker,
-            'direction':  direction,
-            'side':       side,
-            'notional':   dollar_risk,
-            'est_shares': est_shares,
-            'price':      sig['close'],
-            'order_id':   order.get('id'),
-            'status':     'SUBMITTED',
-        })
-
-        # Write entry metadata for exit monitor — Alpaca doesn't track entry
-        # date or partial-exit state, so we persist it ourselves.
-        state = _load_state()
-        state[ticker] = {
-            'entry_date':    str(date.today()),
-            'entry_price':   sig['close'],
-            'direction':     direction,
-            'side':          side,
-            'partial_taken': False,
-            'order_id':      order.get('id'),
+        # 6. Persist state — key is the OCC option symbol
+        state[option_symbol] = {
+            'underlying':                ticker,
+            'direction':                 direction,
+            'option_type':               'call' if direction == 'bullish' else 'put',
+            'strike':                    strike,
+            'expiration':                expiry,
+            'entry_premium':             premium,
+            'contracts':                 1,
+            'underlying_price_at_entry': sig['close'],
+            'entry_date':                str(date.today()),
+            'partial_taken':             False,
+            'realized_pct':              None,
+            'order_id':                  order.get('id'),
         }
         _save_state(state)
 
-        action = 'bought' if side == 'buy' else 'shorted'
-        return f'🤖 Paper trade executed: {action} ~{est_shares:.4f} shares (${dollar_risk:.0f})'
+        _log({
+            'timestamp':     now_str,
+            'ticker':        ticker,
+            'symbol':        option_symbol,
+            'direction':     direction,
+            'strike':        strike,
+            'expiration':    expiry,
+            'entry_premium': premium,
+            'cost':          cost,
+            'order_id':      order.get('id'),
+            'status':        'SUBMITTED',
+        })
+
+        option_label = 'CALL' if direction == 'bullish' else 'PUT'
+        entry_msg = (
+            f'🎯 OPTIONS TRADE | {option_label} {ticker} ${strike:.0f} exp {expiry} '
+            f'| Premium: ${premium:.2f} | Cost: ${cost:.0f} '
+            f'| Underlying: ${sig["close"]:.2f}'
+        )
+        if discord_fn:
+            discord_fn(entry_msg)
+
+        return f'🤖 Options order submitted: {option_symbol} × 1 (${cost:.0f})'
 
     except Exception as e:
         _log({'timestamp': now_str, 'ticker': ticker, 'direction': direction,
@@ -357,19 +440,13 @@ def execute_paper_trade(sig, discord_fn=None):
 def monitor_positions(discord_fn=None):
     """
     Called on every hourly scan (inside market hours).
-    Checks every tracked position against all five exit conditions in priority
-    order and places the appropriate Alpaca order automatically.
 
-    Exit priority (highest to lowest):
-      1. Stop loss      : unrealized P&L ≤ -45%  → close ALL remaining
-      2. Full target    : unrealized P&L ≥ +100% → close ALL remaining
-      3. Trail stop     : partial already taken AND P&L ≤ +25% → close ALL remaining
-      4. Partial exit   : unrealized P&L ≥ +50%, partial NOT yet taken → sell HALF
-      5. Time exit      : calendar days since entry ≥ 7 → close ALL remaining
-
-    If two conditions are simultaneously true (e.g. price past +100% on day 7),
-    the higher-priority condition fires and the lower one is skipped — no
-    double-execution is possible because each branch is an elif.
+    Exit priority (options-specific):
+      1. Stop loss       : pnl_pct ≤ -45%              → market sell-to-close
+      2. Full target     : pnl_pct ≥ +100%             → market sell-to-close
+      3. Trail stop      : partial_taken AND pnl_pct ≤ 0 (breakeven) → sell-to-close
+      4. Partial snapshot: pnl_pct ≥ +50%, not yet taken → record; raise stop to BE
+      5. Time exit       : days_held ≥ 6               → market sell-to-close
     """
     state = _load_state()
     if not state:
@@ -379,68 +456,65 @@ def monitor_positions(discord_fn=None):
     now_str   = datetime.now(ET).isoformat()
     to_remove = []
 
-    for ticker, entry in list(state.items()):
-        pos = get_position(ticker)
+    for option_symbol, entry in list(state.items()):
+        pos = get_position(option_symbol)
 
-        # Position missing from Alpaca — closed manually or order never filled
         if pos is None:
-            to_remove.append(ticker)
-            msg = (f'⚠️ {ticker} position not found in Alpaca '
-                   f'— removed from tracking (closed manually or order lapsed)')
+            to_remove.append(option_symbol)
+            msg = (f'⚠️ {option_symbol} not found in Alpaca — removed from tracking '
+                   f'(expired, closed manually, or order never filled)')
             if discord_fn:
                 discord_fn(msg)
-            _log({'timestamp': now_str, 'ticker': ticker,
+            _log({'timestamp': now_str, 'symbol': option_symbol,
                   'event': 'POSITION_NOT_FOUND', 'status': 'REMOVED'})
             continue
 
-        pnl_pct     = float(pos['unrealized_plpc'])   # e.g. 0.50 = +50%
-        dollar_pnl  = float(pos['unrealized_pl'])
-        qty         = float(pos['qty'])
-        price       = float(pos['current_price'])
-        alpaca_side = pos['side']                      # 'long' or 'short'
-        close_side  = 'sell' if alpaca_side == 'long' else 'buy'
-
+        pnl_pct       = float(pos['unrealized_plpc'])
+        entry_premium = entry.get('entry_premium', float(pos['avg_entry_price']))
         entry_date    = date.fromisoformat(entry['entry_date'])
         days_held     = (today - entry_date).days
         partial_taken = entry.get('partial_taken', False)
 
         # ── Priority 1: Stop loss ─────────────────────────────────────────────
         if pnl_pct <= STOP_PCT:
-            result = _exit_all(ticker, 'STOP', pnl_pct, dollar_pnl, price, qty, discord_fn)
+            result = _exit_option(option_symbol, 'STOP', entry_premium, pos, discord_fn)
             if result == 'OK':
-                to_remove.append(ticker)
+                to_remove.append(option_symbol)
 
         # ── Priority 2: Full target ───────────────────────────────────────────
         elif pnl_pct >= FULL_EXIT_PCT:
-            result = _exit_all(ticker, 'FULL_TARGET', pnl_pct, dollar_pnl, price, qty, discord_fn)
+            result = _exit_option(option_symbol, 'FULL_TARGET', entry_premium, pos, discord_fn)
             if result == 'OK':
-                to_remove.append(ticker)
+                to_remove.append(option_symbol)
 
-        # ── Priority 3: Trail stop (only active after partial taken) ──────────
-        elif partial_taken and pnl_pct <= TRAIL_PCT:
-            result = _exit_all(ticker, 'TRAIL_STOP', pnl_pct, dollar_pnl, price, qty, discord_fn)
+        # ── Priority 3: Trail stop at breakeven (only after partial snapshot) ─
+        elif partial_taken and pnl_pct <= BREAKEVEN_STOP:
+            result = _exit_option(option_symbol, 'TRAIL_STOP', entry_premium, pos, discord_fn)
             if result == 'OK':
-                to_remove.append(ticker)
+                to_remove.append(option_symbol)
 
-        # ── Priority 4: Partial exit (+50%, first time only) ─────────────────
+        # ── Priority 4: Partial snapshot (+50%, first time only) ─────────────
         elif pnl_pct >= TAKE_HALF_PCT and not partial_taken:
-            half_qty    = round(qty / 2, 4)
-            half_dollar = dollar_pnl / 2
-            result = _exit_partial(ticker, half_qty, close_side,
-                                   pnl_pct, half_dollar, price, discord_fn)
-            if result == 'OK':
-                entry['partial_taken'] = True
-                state[ticker] = entry    # update in-memory state before saving
+            entry['partial_taken'] = True
+            entry['realized_pct']  = round(pnl_pct, 4)
+            state[option_symbol]   = entry
 
-        # ── Priority 5: Time exit (7-day force-close) ─────────────────────────
-        elif days_held >= MAX_HOLD_DAYS:
-            result = _exit_all(ticker, 'TIME_EXIT', pnl_pct, dollar_pnl, price, qty, discord_fn)
-            if result == 'OK':
-                to_remove.append(ticker)
+            msg = (f'🎯 PARTIAL TARGET +50% | {option_symbol} '
+                   f'| Stop raised to breakeven | Holding for +100%')
+            if discord_fn:
+                discord_fn(msg)
+            _log({'timestamp': now_str, 'symbol': option_symbol,
+                  'event': 'PARTIAL_SNAPSHOT', 'pnl_pct': round(pnl_pct, 4),
+                  'status': 'HOLDING'})
 
-    # Remove fully-closed positions from state
-    for ticker in to_remove:
-        state.pop(ticker, None)
+        # ── Priority 5: Day-6 time exit ───────────────────────────────────────
+        elif days_held >= OPTIONS_MAX_HOLD:
+            result = _exit_option(option_symbol, 'TIME_EXIT', entry_premium, pos, discord_fn)
+            if result == 'OK':
+                to_remove.append(option_symbol)
+
+    for symbol in to_remove:
+        state.pop(symbol, None)
     _save_state(state)
 
 
@@ -448,20 +522,8 @@ def monitor_positions(discord_fn=None):
 
 def reconcile_positions_on_startup(discord_fn=None):
     """
-    Call once in main() before the scheduler loop starts.
-
-    Fetches every open position from Alpaca and creates a conservative
-    state entry for any that are not already in position_state.json.
-    This guards against the ephemeral Railway filesystem wiping state on
-    redeploy while a position remains open.
-
-    Conservative defaults for adopted positions:
-      entry_date    = today  (7-day timer resets — safe, not dangerous)
-      entry_price   = Alpaca's avg_entry_price (correct cost basis)
-      partial_taken = False  (may re-trigger a partial if price is still
-                              above +50%, but won't double-close since the
-                              monitor uses Alpaca's live qty each cycle)
-      reconciled    = True   (audit flag so you can see in paper_trades.json)
+    Re-adopt open Alpaca options positions not tracked in position_state.json.
+    Guards against Railway ephemeral filesystem wiping state on redeploy.
     """
     try:
         alpaca_positions = get_all_positions()
@@ -471,42 +533,44 @@ def reconcile_positions_on_startup(discord_fn=None):
         for pos in alpaca_positions:
             symbol = pos['symbol']
             if symbol in state:
-                continue  # already tracked — leave existing state untouched
+                continue
+            if pos.get('asset_class') != 'us_option':
+                continue
+            parsed = _parse_occ(symbol)
+            if parsed is None:
+                continue
 
-            alpaca_side = pos['side']                       # 'long' or 'short'
-            entry_price = float(
-                pos.get('avg_entry_price') or pos.get('current_price', 0)
-            )
-
+            entry_premium = float(pos.get('avg_entry_price') or pos.get('current_price', 0))
             state[symbol] = {
-                'entry_date':    str(date.today()),
-                'entry_price':   entry_price,
-                'direction':     'bullish' if alpaca_side == 'long' else 'bearish',
-                'side':          'buy'     if alpaca_side == 'long' else 'sell',
-                'partial_taken': False,
-                'order_id':      None,
-                'reconciled':    True,
+                'underlying':                parsed['underlying'],
+                'direction':                 'bullish' if parsed['option_type'] == 'call' else 'bearish',
+                'option_type':               parsed['option_type'],
+                'strike':                    parsed['strike'],
+                'expiration':                parsed['expiration'],
+                'entry_premium':             entry_premium,
+                'contracts':                 1,
+                'underlying_price_at_entry': None,
+                'entry_date':                str(date.today()),
+                'partial_taken':             False,
+                'realized_pct':              None,
+                'order_id':                  None,
+                'reconciled':                True,
             }
             adopted.append(symbol)
 
         if adopted:
             _save_state(state)
-            msg = (
-                f'🔄 Startup reconciliation: {len(adopted)} orphaned position(s) '
-                f'adopted from Alpaca — {", ".join(adopted)}.\n'
-                f'entry_date reset to today; partial_taken=False. '
-                f'Verify manually if a partial exit was already taken before restart.'
-            )
+            msg = (f'🔄 Startup reconciliation: {len(adopted)} orphaned option(s) adopted '
+                   f'— {", ".join(adopted)}.\n'
+                   f'entry_date reset to today; partial_taken=False. '
+                   f'Verify if a partial snapshot was already recorded before restart.')
             if discord_fn:
                 discord_fn(msg)
             print(f'[reconcile] Adopted: {adopted}')
         else:
-            tracked = len(state)
-            open_n  = len(alpaca_positions)
-            print(f'[reconcile] OK — {tracked} tracked / {open_n} open in Alpaca')
+            print(f'[reconcile] OK — {len(state)} tracked / {len(alpaca_positions)} open in Alpaca')
 
     except Exception as e:
-        # Never let reconciliation failure prevent the scanner from starting
         print(f'[reconcile] Error (scanner will start anyway): {e}')
 
 
@@ -519,35 +583,39 @@ def daily_summary(discord_fn):
         equity       = float(acct['equity'])
         start_equity = _load_start_equity()
         total_ret    = (equity - start_equity) / start_equity * 100
+        today_str    = str(date.today())
 
-        today_str = str(date.today())
-
-        # Trade log stats
-        try:
-            with open(TRADE_LOG) as f:
-                all_trades = json.load(f)
-            today_trades = [t for t in all_trades if t.get('date') == today_str]
-            wins   = sum(1 for t in today_trades if t.get('result') == 'WIN')
-            losses = sum(1 for t in today_trades if t.get('result') == 'LOSS')
-        except Exception:
-            wins = losses = 0
-
-        # Paper execution count today
         try:
             with open(PAPER_TRADES_LOG) as f:
                 paper_log = json.load(f)
-            paper_today = sum(
+            entered_today = sum(
                 1 for p in paper_log
-                if p.get('timestamp', '').startswith(today_str)
-                and p.get('status') == 'SUBMITTED'
+                if p.get('timestamp', '').startswith(today_str) and p.get('status') == 'SUBMITTED'
             )
+            closed_today = [
+                p for p in paper_log
+                if p.get('timestamp', '').startswith(today_str) and p.get('status') == 'CLOSED'
+            ]
         except Exception:
-            paper_today = 0
+            entered_today = 0
+            closed_today  = []
+
+        pnl_lines = ''
+        if closed_today:
+            pnl_lines = '\nClosed today:\n' + '\n'.join(
+                f'  {p.get("symbol", "?")} {p.get("event", "?")} '
+                f'{p.get("pnl_pct", 0) * 100:+.1f}% (${p.get("dollar_pnl", 0):+.2f})'
+                for p in closed_today
+            )
+
+        open_positions = list(_load_state().keys())
+        open_str = ', '.join(open_positions) if open_positions else 'none'
 
         msg = (
             f'📊 **Daily Summary — {today_str}**\n'
-            f'Paper trades executed: {paper_today}\n'
-            f'Trade log today: {wins}W / {losses}L\n'
+            f'Options entered today: {entered_today}\n'
+            f'Options closed today: {len(closed_today)}{pnl_lines}\n'
+            f'Open positions: {open_str}\n'
             f'Paper account equity: ${equity:,.2f}\n'
             f'Total return since start: {total_ret:+.2f}%'
         )
@@ -560,10 +628,7 @@ def daily_summary(discord_fn):
 # ── CONNECTION TEST ────────────────────────────────────────────────────────────
 
 def test_connection():
-    """
-    Verify paper API auth, place 1-share SPY order, then cancel or close it.
-    Safe to run during market hours or when closed.
-    """
+    """Verify paper API auth and account status. No orders placed."""
     print('─' * 62)
     print('  ALPACA PAPER API — CONNECTION TEST')
     print('  Base URL:', PAPER_BASE_URL)
@@ -575,47 +640,18 @@ def test_connection():
     print(f'   Status      : {acct["status"]}')
     print(f'   Equity      : ${float(acct["equity"]):,.2f}')
     print(f'   Cash        : ${float(acct["cash"]):,.2f}')
-    print(f'   Shorting    : {acct.get("shorting_enabled")}')
-    print(f'   Pattern Day : {acct.get("pattern_day_trader")}')
+    print(f'   Options lvl : {acct.get("options_approved_level")}')
+    print(f'   Opt BP      : ${float(acct.get("options_buying_power", 0)):,.2f}')
 
-    print('\n2. Checking for existing SPY position …')
-    pos = get_position('SPY')
-    if pos:
-        print(f'   Existing position: {pos["qty"]} shares. Skipping test order.')
-        print('\n   ✓ Auth confirmed via account + position fetch.')
-        return
-
-    print('   No existing position — placing 1-share market order …')
-    order = _place_qty_order('SPY', 'buy', 1)
-    oid   = order['id']
-    print(f'   Order ID    : {oid}')
-    print(f'   Symbol      : {order["symbol"]}')
-    print(f'   Side        : {order["side"]}')
-    print(f'   Qty         : {order["qty"]}')
-    print(f'   Status      : {order["status"]}')
-
-    print('\n3. Waiting 3s …')
-    time.sleep(3)
-
-    # Fetch updated order state
-    r = requests.get(f'{PAPER_BASE_URL}/v2/orders/{oid}',
-                     headers=_headers(), timeout=10)
-    updated = r.json() if r.ok else {}
-    filled_status = updated.get('status', order['status'])
-    print(f'   Order status after wait: {filled_status}')
-
-    print('\n4. Cleaning up …')
-    if filled_status in ('filled', 'partially_filled'):
-        try:
-            close = close_position('SPY')
-            print(f'   Position closed — order {close.get("id", "n/a")}')
-        except Exception as e:
-            print(f'   Close position error: {e}')
+    print('\n2. Open positions …')
+    positions = get_all_positions()
+    if positions:
+        for p in positions:
+            print(f'   {p["symbol"]:<28} {p.get("asset_class","?"):<12} qty={p["qty"]}')
     else:
-        cancelled = _cancel_order(oid)
-        print(f'   Order cancelled: {cancelled}')
+        print('   No open positions.')
 
-    print('\n   ✓ Test complete. Paper API authenticated and functional.')
+    print('\n   ✓ Auth confirmed.')
     print('─' * 62)
 
 
