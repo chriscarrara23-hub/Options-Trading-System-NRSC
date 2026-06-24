@@ -269,12 +269,7 @@ def run_scan():
         _log_scan({'timestamp': now_str, 'event': 'EOD_CLEAR'})
         return
 
-    # ── Step 3: No new entries after 3:30pm ──────────────────────────────────
-    if not _can_enter():
-        print('  After 3:30pm — no new entries.')
-        return
-
-    # ── Step 4: Cooldown check ────────────────────────────────────────────────
+    # ── Step 3: Cooldown check ───────────────────────────────────────────────
     consec = today_consecutive_losses()
     if consec >= COOLDOWN_N:
         msg = '🛑 Trading paused — 3 consecutive losses today. Review before tomorrow.'
@@ -286,6 +281,7 @@ def run_scan():
     state      = load_state()
     pending    = _load_pending()
     new_pending = {}   # rebuilt each scan; only carries forward freshly detected spikes
+    can_enter  = _can_enter()
 
     for ticker in TICKERS:
         bars = fetch_bars(ticker, limit=25)
@@ -332,7 +328,10 @@ def run_scan():
             # Either way, don't carry forward this pending entry
             continue
 
-        # ── 5b. Detect new spike on bars[-1] ─────────────────────────────────
+        # ── 5b. Detect new spike on bars[-1] — gated by entry cutoff ────────
+        if not can_enter:
+            continue
+
         if ticker in state:
             print(f'  {ticker}: position open')
             continue
