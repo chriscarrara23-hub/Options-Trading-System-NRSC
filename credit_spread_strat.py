@@ -505,14 +505,15 @@ def _find_target_expiration():
 
 def _fetch_options_chain(expiry, now_str):
     """
-    Fetch SPY put chain for expiry from Alpaca v2 REST API.
+    Fetch SPY put chain for expiry.
+    Contracts: paper-api.alpaca.markets/v2/options/contracts (trading API)
+    Snapshots: data.alpaca.markets/v1beta1/options/snapshots (market data API)
     Returns dict {symbol: {strike, bid, ask, mid, delta, iv}} or None on any failure.
-    All failure modes are logged to credit_spread_log.json and return None — never raise.
     """
     try:
         r = _alpaca_get(
-            f'{DATA_URL}/v2/options/contracts',
-            headers=_data_headers(),
+            f'{PAPER_BASE_URL}/v2/options/contracts',
+            headers=_headers(),
             params={
                 'underlying_symbols': 'SPY',
                 'type':               'put',
@@ -543,7 +544,7 @@ def _fetch_options_chain(expiry, now_str):
             batch = symbols[batch_start:batch_start + 100]
             try:
                 rs = _alpaca_get(
-                    f'{DATA_URL}/v2/options/snapshots',
+                    f'{DATA_URL}/v1beta1/options/snapshots',
                     headers=_data_headers(),
                     params={'symbols': ','.join(batch), 'feed': 'indicative'},
                     timeout=15,
@@ -696,7 +697,7 @@ def _current_cost_to_close(short_sym, long_sym):
     """
     try:
         rs = _alpaca_get(
-            f'{DATA_URL}/v2/options/snapshots',
+            f'{DATA_URL}/v1beta1/options/snapshots',
             headers=_data_headers(),
             params={'symbols': f'{short_sym},{long_sym}', 'feed': 'indicative'},
         )
