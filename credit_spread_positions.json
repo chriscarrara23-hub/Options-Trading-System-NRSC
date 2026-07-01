@@ -1,0 +1,37 @@
+{
+  "positions": [
+    {
+      "short_symbol": "SPY260708P00734000",
+      "long_symbol": "SPY260708P00729000",
+      "short_strike": 734.0,
+      "long_strike": 729.0,
+      "expiration": "2026-07-08",
+      "credit": 0.57,
+      "max_risk": 443.0,
+      "breakeven": 733.43,
+      "profit_target": 0.285,
+      "stop_loss_cost": 1.14,
+      "open_time": "2026-07-01 (reconstructed)",
+      "entry_order_id": null,
+      "short_delta": null,
+      "spy_entry_px": null
+    },
+    {
+      "short_symbol": "SPY260708P00736000",
+      "long_symbol": "SPY260708P00731000",
+      "short_strike": 736.0,
+      "long_strike": 731.0,
+      "expiration": "2026-07-08",
+      "credit": 0.54,
+      "max_risk": 446.0,
+      "breakeven": 735.46,
+      "profit_target": 0.27,
+      "stop_loss_cost": 1.08,
+      "open_time": "2026-07-01 (reconstructed)",
+      "entry_order_id": null,
+      "short_delta": null,
+      "spy_entry_px": null
+    }
+  ],
+  "daily_summary_sent": "2026-07-01"
+}
