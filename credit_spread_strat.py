@@ -32,6 +32,11 @@ import yfinance as yf
 from dotenv import load_dotenv
 from scipy.stats import norm
 
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
 load_dotenv()
 
 # ── ACTIVATION FLAG ────────────────────────────────────────────────────────────
@@ -43,6 +48,7 @@ ALPACA_KEY      = os.getenv('ALPACA_KEY')
 ALPACA_SECRET   = os.getenv('ALPACA_SECRET')
 PAPER_BASE_URL  = 'https://paper-api.alpaca.markets'
 DATA_URL        = 'https://data.alpaca.markets'
+DATABASE_URL    = os.getenv('DATABASE_URL')
 ET              = pytz.timezone('US/Eastern')
 _DIR            = os.path.dirname(os.path.abspath(__file__))
 
@@ -113,6 +119,238 @@ def _alpaca_get(url, **kwargs):
             if attempt < 2:
                 time.sleep(1)
     return None
+
+
+# ── DATABASE ───────────────────────────────────────────────────────────────────
+
+_DB = None  # module-level psycopg2 connection
+
+
+def _get_db():
+    """Return a live psycopg2 connection, or None if DATABASE_URL is not set."""
+    global _DB
+    if not DATABASE_URL or psycopg2 is None:
+        return None
+    try:
+        if _DB is None or _DB.closed:
+            _DB = psycopg2.connect(DATABASE_URL)
+        return _DB
+    except Exception as e:
+        print(f'[db] Connection failed: {e}')
+        return None
+
+
+def _init_db():
+    """Create tables if they don't exist. Logs connection on success."""
+    conn = _get_db()
+    if conn is None:
+        if DATABASE_URL and psycopg2 is None:
+            print('[db] WARNING — DATABASE_URL set but psycopg2 not installed; falling back to JSON')
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS credit_spread_positions (
+                id             SERIAL PRIMARY KEY,
+                short_symbol   TEXT NOT NULL,
+                long_symbol    TEXT NOT NULL,
+                short_strike   DOUBLE PRECISION,
+                long_strike    DOUBLE PRECISION,
+                expiration     TEXT,
+                credit         DOUBLE PRECISION,
+                max_risk       DOUBLE PRECISION,
+                breakeven      DOUBLE PRECISION,
+                profit_target  DOUBLE PRECISION,
+                stop_loss_cost DOUBLE PRECISION,
+                open_time      TEXT,
+                entry_order_id TEXT,
+                short_delta    DOUBLE PRECISION,
+                spy_entry_px   DOUBLE PRECISION,
+                reconciled     BOOLEAN DEFAULT FALSE,
+                note           TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS credit_spread_state (
+                id                   INTEGER PRIMARY KEY DEFAULT 1,
+                weekly_realized_loss DOUBLE PRECISION DEFAULT 0.0,
+                cooldown_active      BOOLEAN DEFAULT FALSE,
+                week_start_date      TEXT,
+                daily_summary_sent   TEXT
+            )
+        """)
+        conn.commit()
+        print('[db] Connected to PostgreSQL — persistent storage active')
+
+        # One-time migration: seed from JSON files if tables are empty on first boot
+        cur.execute('SELECT COUNT(*) FROM credit_spread_positions')
+        if cur.fetchone()[0] == 0 and os.path.exists(POSITIONS_FILE):
+            try:
+                with open(POSITIONS_FILE) as f:
+                    j = json.load(f)
+                if isinstance(j, dict) and j.get('positions'):
+                    _db_save_positions(j)
+                    print(f'[db] Migrated {len(j["positions"])} position(s) from JSON')
+            except Exception as me:
+                print(f'[db] JSON positions migration failed: {me}')
+
+        cur.execute('SELECT COUNT(*) FROM credit_spread_state')
+        if cur.fetchone()[0] == 0 and os.path.exists(WEEKLY_FILE):
+            try:
+                with open(WEEKLY_FILE) as f:
+                    j = json.load(f)
+                if isinstance(j, dict) and j.get('week_start_date'):
+                    _db_save_weekly(j)
+                    print('[db] Migrated weekly state from JSON')
+            except Exception as me:
+                print(f'[db] JSON weekly migration failed: {me}')
+
+    except Exception as e:
+        print(f'[db] _init_db failed: {e}')
+
+
+def _db_load_positions():
+    """Load positions list and daily_summary_sent from PostgreSQL. Returns None on failure."""
+    conn = _get_db()
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT short_symbol, long_symbol, short_strike, long_strike,
+                   expiration, credit, max_risk, breakeven, profit_target,
+                   stop_loss_cost, open_time, entry_order_id, short_delta,
+                   spy_entry_px, reconciled, note
+            FROM credit_spread_positions ORDER BY id
+        """)
+        positions = []
+        for row in cur.fetchall():
+            pos = {
+                'short_symbol':   row[0],
+                'long_symbol':    row[1],
+                'short_strike':   row[2],
+                'long_strike':    row[3],
+                'expiration':     row[4],
+                'credit':         row[5],
+                'max_risk':       row[6],
+                'breakeven':      row[7],
+                'profit_target':  row[8],
+                'stop_loss_cost': row[9],
+                'open_time':      row[10],
+                'entry_order_id': row[11],
+                'short_delta':    row[12],
+                'spy_entry_px':   row[13],
+            }
+            if row[14]:
+                pos['reconciled'] = True
+            if row[15]:
+                pos['note'] = row[15]
+            positions.append(pos)
+
+        cur.execute('SELECT daily_summary_sent FROM credit_spread_state WHERE id = 1')
+        row = cur.fetchone()
+        return {'positions': positions, 'daily_summary_sent': row[0] if row else None}
+    except Exception as e:
+        print(f'[db] _db_load_positions failed: {e}')
+        return None
+
+
+def _db_save_positions(ps):
+    """Replace all rows in credit_spread_positions and update daily_summary_sent."""
+    conn = _get_db()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute('DELETE FROM credit_spread_positions')
+        for pos in ps.get('positions', []):
+            cur.execute("""
+                INSERT INTO credit_spread_positions (
+                    short_symbol, long_symbol, short_strike, long_strike,
+                    expiration, credit, max_risk, breakeven, profit_target,
+                    stop_loss_cost, open_time, entry_order_id, short_delta,
+                    spy_entry_px, reconciled, note
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                pos.get('short_symbol'),    pos.get('long_symbol'),
+                pos.get('short_strike'),    pos.get('long_strike'),
+                pos.get('expiration'),      pos.get('credit'),
+                pos.get('max_risk'),        pos.get('breakeven'),
+                pos.get('profit_target'),   pos.get('stop_loss_cost'),
+                pos.get('open_time'),       pos.get('entry_order_id'),
+                pos.get('short_delta'),     pos.get('spy_entry_px'),
+                bool(pos.get('reconciled', False)),
+                pos.get('note'),
+            ))
+        cur.execute("""
+            INSERT INTO credit_spread_state (id, daily_summary_sent)
+            VALUES (1, %s)
+            ON CONFLICT (id) DO UPDATE SET daily_summary_sent = EXCLUDED.daily_summary_sent
+        """, (ps.get('daily_summary_sent'),))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f'[db] _db_save_positions failed: {e}')
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def _db_load_weekly():
+    """Load weekly state from PostgreSQL. Returns None on failure or no row."""
+    conn = _get_db()
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT weekly_realized_loss, cooldown_active, week_start_date
+            FROM credit_spread_state WHERE id = 1
+        """)
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            'weekly_realized_loss': float(row[0] or 0.0),
+            'cooldown_active':      bool(row[1]),
+            'week_start_date':      row[2],
+        }
+    except Exception as e:
+        print(f'[db] _db_load_weekly failed: {e}')
+        return None
+
+
+def _db_save_weekly(w):
+    """Upsert weekly state in PostgreSQL."""
+    conn = _get_db()
+    if conn is None:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO credit_spread_state
+                (id, weekly_realized_loss, cooldown_active, week_start_date)
+            VALUES (1, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                weekly_realized_loss = EXCLUDED.weekly_realized_loss,
+                cooldown_active      = EXCLUDED.cooldown_active,
+                week_start_date      = EXCLUDED.week_start_date
+        """, (
+            w.get('weekly_realized_loss', 0.0),
+            bool(w.get('cooldown_active', False)),
+            w.get('week_start_date'),
+        ))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f'[db] _db_save_weekly failed: {e}')
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
 
 
 # ── MARKET HOURS ───────────────────────────────────────────────────────────────
@@ -201,6 +439,11 @@ def _log_trade(entry):
 # Schema: {"positions": [...], "daily_summary_sent": null | "YYYY-MM-DD"}
 
 def _load_positions():
+    if DATABASE_URL:
+        result = _db_load_positions()
+        if result is not None:
+            return result
+        print('[db] _load_positions: DB unavailable, falling back to JSON')
     try:
         with open(POSITIONS_FILE) as f:
             d = json.load(f)
@@ -212,11 +455,13 @@ def _load_positions():
 
 
 def _save_positions(ps):
+    if DATABASE_URL:
+        if _db_save_positions(ps):
+            return
+        print('[db] _save_positions: DB write failed, falling back to JSON')
     try:
-        tmp = POSITIONS_FILE + '.tmp'
-        with open(tmp, 'w') as f:
+        with open(POSITIONS_FILE, 'w') as f:
             json.dump(ps, f, indent=2, default=str)
-        os.replace(tmp, POSITIONS_FILE)
     except Exception as e:
         print(f'  [_save_positions] failed: {e}')
 
@@ -243,6 +488,11 @@ def _empty_weekly():
 
 
 def _load_weekly():
+    if DATABASE_URL:
+        result = _db_load_weekly()
+        if result is not None:
+            return result
+        print('[db] _load_weekly: DB unavailable, falling back to JSON')
     try:
         with open(WEEKLY_FILE) as f:
             d = json.load(f)
@@ -254,11 +504,13 @@ def _load_weekly():
 
 
 def _save_weekly(w):
+    if DATABASE_URL:
+        if _db_save_weekly(w):
+            return
+        print('[db] _save_weekly: DB write failed, falling back to JSON')
     try:
-        tmp = WEEKLY_FILE + '.tmp'
-        with open(tmp, 'w') as f:
+        with open(WEEKLY_FILE, 'w') as f:
             json.dump(w, f, indent=2, default=str)
-        os.replace(tmp, WEEKLY_FILE)
     except Exception as e:
         print(f'  [_save_weekly] failed: {e}')
 
@@ -282,6 +534,8 @@ def _init_files():
         (SCAN_LOG_FILE,  []),
     ]
     for path, empty in defaults:
+        if DATABASE_URL and path in (POSITIONS_FILE, WEEKLY_FILE):
+            continue  # DB is the primary store for these two files
         if not os.path.exists(path):
             with open(path, 'w') as f:
                 json.dump(empty, f, indent=2)
@@ -1375,6 +1629,7 @@ def main():
     print('  Scan every 15 min, 9:30–16:00 ET, Mon–Fri')
     print('=' * 62)
 
+    _init_db()
     _init_files()
     _reconcile_on_startup()
 
