@@ -1522,6 +1522,42 @@ def _evaluate_ticker(ticker, pos_state, weekly, now_str):
     }, conds
 
 
+PREMARKET_HOUR, PREMARKET_MINUTE = 9, 0   # fires once, 9:00-9:04am ET
+
+
+def _is_premarket_time():
+    now = datetime.now(ET)
+    return now.hour == PREMARKET_HOUR and PREMARKET_MINUTE <= now.minute < PREMARKET_MINUTE + 5
+
+
+def _check_premarket_report(pos_state, weekly, now_str):
+    """Send once-daily parameter/status report before market open."""
+    today_str = datetime.now(ET).date().isoformat()
+    if pos_state.get('premarket_report_sent') == today_str:
+        return
+    if not _is_premarket_time():
+        return
+
+    pos_state['premarket_report_sent'] = today_str
+    _save_positions(pos_state)
+
+    real_pos = [p for p in pos_state.get('positions', [])
+                if not (p.get('reconciled') and p.get('short_symbol') == 'UNKNOWN')]
+    macro = _macro_event_today()
+
+    msg = (
+        f'🌅 **Pre-Market Report — {today_str}**\n'
+        f'Strategy: {", ".join(TICKERS)} put credit spreads, {TARGET_DTE} DTE\n'
+        f'Target delta: {TARGET_DELTA} (±{DELTA_TOLERANCE})  |  Spread width: ${SPREAD_WIDTH}  |  Min credit: ${MIN_CREDIT}\n'
+        f'Profit target: {int(PROFIT_TARGET_PCT*100)}%  |  Stop loss: {int(STOP_LOSS_PCT*100)}%\n'
+        f'Max positions: {MAX_POSITIONS}  |  Currently open: {len(real_pos)}\n'
+        f'IV rank min: {MIN_IVR}%  |  VIX cap: {MAX_VIX}\n'
+        f'Weekly loss so far: ${weekly.get("weekly_realized_loss", 0):.2f} / ${WEEKLY_LOSS_LIMIT:.0f}\n'
+        f'Cooldown active: {weekly.get("cooldown_active", False)}\n'
+        f"Today's macro block: {macro or 'none — clear to trade'}"
+    )
+    _discord(msg)
+    print(f'[premarket] Report sent for {today_str}')
 # ── DAILY SUMMARY ──────────────────────────────────────────────────────────────
 
 def _check_daily_summary(pos_state, weekly, now_str):
@@ -1634,6 +1670,11 @@ def run_scan():
         _log({'timestamp': now_str, 'event': 'MONITOR_ERROR',
               'error': f'{type(e).__name__}: {e}'})
 
+   # ── Pre-market report ──────────────────────────────────────────────────────
+    try:
+        _check_premarket_report(pos_state, weekly, now_str)
+    except Exception as e:
+        print(f'  [premarket] ERROR — {type(e).__name__}: {e}') 
     # ── 2. Daily summary ───────────────────────────────────────────────────────
     try:
         _check_daily_summary(pos_state, weekly, now_str)
