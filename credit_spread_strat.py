@@ -1650,17 +1650,23 @@ def _check_daily_summary(pos_state, weekly, now_str):
 # ── MAIN SCAN ──────────────────────────────────────────────────────────────────
 
 def run_scan():
+    now_str = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
+    pos_state = _load_positions()
+    weekly    = _load_weekly()
+    weekly    = _reset_weekly_if_needed(weekly)
+
+    # ── Pre-market report (runs even outside market hours) ─────────────────────
+    try:
+        _check_premarket_report(pos_state, weekly, now_str)
+    except Exception as e:
+        print(f'  [premarket] ERROR — {type(e).__name__}: {e}')
+
     if not is_market_hours():
         print(f'[{datetime.now(ET).strftime("%H:%M ET")}] '
               f'Credit spread: outside market hours, skipping.')
         return
 
-    now_str = datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')
     print(f'\n[{now_str}] Credit spread scan  (ACTIVE={ACTIVE})…')
-
-    pos_state = _load_positions()
-    weekly    = _load_weekly()
-    weekly    = _reset_weekly_if_needed(weekly)
 
     # ── 1. Monitor open positions ──────────────────────────────────────────────
     try:
@@ -1674,7 +1680,7 @@ def run_scan():
     try:
         _check_premarket_report(pos_state, weekly, now_str)
     except Exception as e:
-        print(f'  [premarket] ERROR — {type(e).__name__}: {e}') 
+        print(f'  [premarket] ERROR — {type(e).__name__}: {e}')
     # ── 2. Daily summary ───────────────────────────────────────────────────────
     try:
         _check_daily_summary(pos_state, weekly, now_str)
