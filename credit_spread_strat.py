@@ -61,14 +61,21 @@ DELTA_TOLERANCE   = 0.05     # reject if no strike within 0.05 of target delta
 SPREAD_WIDTH      = 5.0
 MIN_CREDIT        = 0.25
 MAX_POSITIONS     = 2
-TICKERS           = ['SPY', 'QQQ']   # underlyings traded; shared 2-position limit
+TICKERS           = ['SPY']   # underlyings for NEW entries; shared 2-position limit.
+                              # NOTE: QQQ removed 2026-07 — existing open QQQ positions
+                              # (if any) are still monitored normally by
+                              # _monitor_positions(), which reads pos_state directly
+                              # and does not filter by TICKERS. See _tracked_symbols()
+                              # for why reconciliation/summary checks need more than
+                              # this list while legacy QQQ positions remain open.
 PROFIT_TARGET_PCT = 0.50
 STOP_LOSS_PCT     = 2.00
 ORDER_FILL_TIMEOUT = 300
 WEEKLY_LOSS_LIMIT = 1_000.0
 RISK_FREE_RATE    = 0.045
-VIX_IVR_WINDOW    = 252
-MIN_IVR           = 30.0
+RV_RANK_WINDOW    = 252      # trailing window for the realized-vol-rank percentile
+HV_WINDOW         = 20       # realized-vol lookback (trading days) used to build that rank
+MIN_REALIZED_VOL_RANK = 30.0
 MAX_VIX           = 35.0
 SMA_PERIOD        = 20
 
@@ -612,11 +619,27 @@ def _init_files():
 
 # ── STARTUP RECONCILIATION ─────────────────────────────────────────────────────
 
+def _tracked_symbols(pos_state):
+    """
+    Alpaca-symbol prefixes to treat as "ours" for reconciliation/summary checks:
+    TICKERS (tickers eligible for NEW entries) unioned with the ticker of every
+    position actually in state right now. This matters when a ticker is removed
+    from TICKERS (e.g. QQQ) while positions in that ticker are still open — without
+    the union, those legs would stop matching Alpaca's leg count and trigger a false
+    "mismatch"/"stale entries" alert until the legacy position closes naturally.
+    """
+    tickers = set(TICKERS)
+    for p in pos_state.get('positions', []):
+        tickers.add(p.get('ticker') or p.get('short_symbol', '')[:3])
+    return tickers
+
+
 def _reconcile_on_startup():
     """
     Load state files, cross-check against Alpaca open options positions, and return (pos_state, weekly).
 
-    Alpaca sync: queries /v2/positions for open SPY option legs.
+    Alpaca sync: queries /v2/positions for open option legs across _tracked_symbols()
+    (TICKERS plus any ticker with a currently open position).
     Each tracked spread = 2 legs. Mismatch → Discord alert.
     If Alpaca has MORE legs than the file expects, placeholder entries are added to
     block new entries until the user manually resolves untracked positions.
@@ -632,10 +655,11 @@ def _reconcile_on_startup():
         r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
         if r is None:
             raise RuntimeError('positions fetch returned None after retries')
+        tracked_symbols = _tracked_symbols(pos_state)
         option_legs = [
             p for p in r.json()
             if p.get('asset_class') == 'us_option'
-            and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)
+            and any(str(p.get('symbol', '')).startswith(t) for t in tracked_symbols)
         ]
         expected_legs = len(pos_state.get('positions', [])) * 2
         actual_legs   = len(option_legs)
@@ -772,23 +796,64 @@ def _above_sma20(ticker):
         return None, None, None
 
 
-def _vix_ivrank():
-    """Return (ivr_pct: float|None, vix: float|None). IVR = 252-day percentile."""
+def _current_vix():
+    """
+    Latest VIX close. Used only for the MAX_VIX crash-protection cap and as the
+    delta-fallback sigma in _find_short_strike() — VIX is a genuine market-wide
+    panic gauge, so it stays even though the entry-rank filter below no longer
+    uses it.
+    """
     try:
-        df = yf.download('^VIX', period=f'{VIX_IVR_WINDOW + 60}d',
-                         interval='1d', progress=False, auto_adjust=False, timeout=10)
+        df = yf.download('^VIX', period='10d', interval='1d',
+                         progress=False, auto_adjust=False, timeout=10)
+        if df.empty:
+            return None
+        df     = _flatten_columns(df)
+        closes = df['Close'].dropna().values
+        if len(closes) < 1:
+            return None
+        return round(float(closes[-1]), 2)
+    except Exception as e:
+        print(f'  [current_vix] {e}')
+        return None
+
+
+def _spy_realized_vol_rank():
+    """
+    Return (rank_pct: float|None, realized_vol_pct: float|None).
+
+    NOT true implied-volatility rank — genuine historical SPY options IV isn't
+    available for free. yfinance only exposes the CURRENT live option chain (no
+    historical IV archive), and Alpaca's options snapshots endpoint (used in
+    _fetch_options_chain()) is likewise live/current-only. As a SPY-specific
+    stand-in, this computes SPY's own trailing HV_WINDOW-day REALIZED volatility
+    from real daily closes, then ranks today's reading against its own trailing
+    RV_RANK_WINDOW-day distribution — same percentile math the old VIX-based IV
+    rank used, just sourced from SPY's own price action instead of a market-wide
+    index. Realized vol is backward-looking (what SPY actually did) rather than
+    forward-looking (what the market currently expects), so it can lag a true IV
+    run-up ahead of an anticipated event — but macro event days are already
+    independently blocked by _macro_event_today().
+    """
+    try:
+        df = yf.download('SPY', period=f'{RV_RANK_WINDOW + HV_WINDOW + 30}d',
+                         interval='1d', progress=False, auto_adjust=True, timeout=10)
         if df.empty:
             return None, None
-        df          = _flatten_columns(df)
-        closes      = df['Close'].dropna().values
-        if len(closes) < 2:
+        df      = _flatten_columns(df)
+        closes  = df['Close'].dropna()
+        if len(closes) < HV_WINDOW + 2:
             return None, None
-        window      = closes[-VIX_IVR_WINDOW:] if len(closes) >= VIX_IVR_WINDOW else closes
-        current_vix = float(closes[-1])
-        ivr         = float((window < current_vix).sum()) / len(window) * 100
-        return round(ivr, 1), round(current_vix, 2)
+        log_ret = (closes / closes.shift(1)).apply(math.log)
+        rv      = (log_ret.rolling(HV_WINDOW).std() * math.sqrt(252) * 100).dropna().values
+        if len(rv) < 2:
+            return None, None
+        window      = rv[-RV_RANK_WINDOW:] if len(rv) >= RV_RANK_WINDOW else rv
+        current_rv  = float(rv[-1])
+        rank        = float((window < current_rv).sum()) / len(window) * 100
+        return round(rank, 1), round(current_rv, 2)
     except Exception as e:
-        print(f'  [vix_ivrank] {e}')
+        print(f'  [spy_realized_vol_rank] {e}')
         return None, None
 
 
@@ -1421,10 +1486,15 @@ def _macro_event_today():
 def _check_entry_conditions(ticker, pos_state, weekly):
     """
     Evaluate all gates cheapest-first. Short-circuits on first group failure.
-    Returns (all_passed: bool, conditions: dict, stock_px, ivr, vix).
+    Returns (all_passed: bool, conditions: dict, stock_px, realized_vol_rank, vix).
+
+    NOTE: realized_vol_rank is SPY's own trailing realized-vol percentile, NOT
+    true implied-vol rank — see _spy_realized_vol_rank() for why. vix remains a
+    separate, genuine market-wide reading used only for the MAX_VIX cap and the
+    delta-fallback sigma in _find_short_strike().
     """
     conds    = {}
-    stock_px = ivr = vix = None
+    stock_px = realized_vol_rank = vix = None
 
     def _c(name, passed, detail):
         conds[name] = {'passed': bool(passed), 'detail': str(detail)}
@@ -1433,7 +1503,7 @@ def _check_entry_conditions(ticker, pos_state, weekly):
     macro = _macro_event_today()
     _c('macro_event', macro is None, macro or 'none')
     if macro:
-        return False, conds, stock_px, ivr, vix
+        return False, conds, stock_px, realized_vol_rank, vix
 
     # Cheap gates (no API calls)
     _c('active',          ACTIVE,
@@ -1446,7 +1516,7 @@ def _check_entry_conditions(ticker, pos_state, weekly):
        f'loss=${weekly.get("weekly_realized_loss", 0):.2f} / ${WEEKLY_LOSS_LIMIT:.0f}')
 
     if not all(v['passed'] for v in conds.values()):
-        return False, conds, stock_px, ivr, vix
+        return False, conds, stock_px, realized_vol_rank, vix
 
     # Underwater position gate — don't add a second spread if the first is at a loss
     real_pos = [p for p in pos_state.get('positions', [])
@@ -1457,7 +1527,7 @@ def _check_entry_conditions(ticker, pos_state, weekly):
         if cost is not None and cost > p.get('credit', 0):
             _c('underwater_block', False,
                f'cost={cost:.4f} > credit={p.get("credit", 0):.4f}')
-            return False, conds, stock_px, ivr, vix
+            return False, conds, stock_px, realized_vol_rank, vix
 
     # SMA filter
     above_sma, stock_close, sma_val = _above_sma20(ticker)
@@ -1471,20 +1541,25 @@ def _check_entry_conditions(ticker, pos_state, weekly):
            f'{"above" if above_sma else "BELOW"}')
 
     if not all(v['passed'] for v in conds.values()):
-        return False, conds, stock_px, ivr, vix
+        return False, conds, stock_px, realized_vol_rank, vix
 
-    # IV rank + VIX cap
-    ivr, vix = _vix_ivrank()
-    if ivr is None:
-        _c('iv_rank', False, 'VIX data unavailable')
-        _c('vix_cap',  False, 'VIX data unavailable')
+    # Realized-vol rank (SPY-specific, NOT implied vol) + VIX cap (market-wide, separate source)
+    realized_vol_rank, spy_rv = _spy_realized_vol_rank()
+    vix = _current_vix()
+
+    if realized_vol_rank is None:
+        _c('realized_vol_rank', False, 'SPY volatility data unavailable')
     else:
-        _c('iv_rank', ivr >= MIN_IVR,
-           f'IVR={ivr:.1f}% (need ≥{MIN_IVR}%) — VIX={vix:.2f}')
-        _c('vix_cap',  vix < MAX_VIX,
+        _c('realized_vol_rank', realized_vol_rank >= MIN_REALIZED_VOL_RANK,
+           f'RV-rank={realized_vol_rank:.1f}% (need ≥{MIN_REALIZED_VOL_RANK}%) — SPY realized vol={spy_rv:.1f}%')
+
+    if vix is None:
+        _c('vix_cap', False, 'VIX data unavailable')
+    else:
+        _c('vix_cap', vix < MAX_VIX,
            f'VIX={vix:.2f} {"<" if vix < MAX_VIX else "≥"} {MAX_VIX}')
 
-    return all(v['passed'] for v in conds.values()), conds, stock_px, ivr, vix
+    return all(v['passed'] for v in conds.values()), conds, stock_px, realized_vol_rank, vix
 
 
 # ── TICKER EVALUATION ──────────────────────────────────────────────────────────
@@ -1494,9 +1569,10 @@ def _evaluate_ticker(ticker, pos_state, weekly, now_str):
     Full entry evaluation for one ticker.
     Returns (signal_dict | None, conditions_dict).
     signal_dict has keys: ticker, expiry, short_sym, long_sym, short_strike,
-                          long_strike, short_delta, credit, stock_px, ivr, vix.
+                          long_strike, short_delta, credit, stock_px,
+                          realized_vol_rank, vix.
     """
-    passed, conds, stock_px, ivr, vix = _check_entry_conditions(ticker, pos_state, weekly)
+    passed, conds, stock_px, realized_vol_rank, vix = _check_entry_conditions(ticker, pos_state, weekly)
     if not passed:
         return None, conds
 
@@ -1541,17 +1617,17 @@ def _evaluate_ticker(ticker, pos_state, weekly, now_str):
     conds['min_credit'] = {'passed': True, 'detail': f'credit=${credit:.4f}'}
 
     return {
-        'ticker':       ticker,
-        'expiry':       expiry,
-        'short_sym':    short_sym,
-        'long_sym':     long_sym,
-        'short_strike': short_strike,
-        'long_strike':  long_strike,
-        'short_delta':  short_delta,
-        'credit':       credit,
-        'stock_px':     stock_px,
-        'ivr':          ivr,
-        'vix':          vix,
+        'ticker':             ticker,
+        'expiry':             expiry,
+        'short_sym':          short_sym,
+        'long_sym':           long_sym,
+        'short_strike':       short_strike,
+        'long_strike':        long_strike,
+        'short_delta':        short_delta,
+        'credit':             credit,
+        'stock_px':           stock_px,
+        'realized_vol_rank':  realized_vol_rank,
+        'vix':                vix,
     }, conds
 
 
@@ -1584,7 +1660,7 @@ def _check_premarket_report(pos_state, weekly, now_str):
         f'Target delta: {TARGET_DELTA} (±{DELTA_TOLERANCE})  |  Spread width: ${SPREAD_WIDTH}  |  Min credit: ${MIN_CREDIT}\n'
         f'Profit target: {int(PROFIT_TARGET_PCT*100)}%  |  Stop loss: {int(STOP_LOSS_PCT*100)}%\n'
         f'Max positions: {MAX_POSITIONS}  |  Currently open: {len(real_pos)}\n'
-        f'IV rank min: {MIN_IVR}%  |  VIX cap: {MAX_VIX}\n'
+        f'Realized vol rank min: {MIN_REALIZED_VOL_RANK}%  |  VIX cap: {MAX_VIX}\n'
         f'Weekly loss so far: ${weekly.get("weekly_realized_loss", 0):.2f} / ${WEEKLY_LOSS_LIMIT:.0f}\n'
         f'Cooldown active: {weekly.get("cooldown_active", False)}\n'
         f"Today's macro block: {macro or 'none — clear to trade'}"
@@ -1641,14 +1717,17 @@ def _check_daily_summary(pos_state, weekly, now_str):
             if cost is not None:
                 unrealized_pnl += round((pos.get('credit', 0) - cost) * 100, 2)
 
-    # Cross-check Alpaca for open SPY option legs — survives a wiped positions file.
+    # Cross-check Alpaca for open option legs — survives a wiped positions file.
+    # Uses _tracked_symbols() (not raw TICKERS) so legacy positions in a ticker
+    # removed from TICKERS (e.g. QQQ) don't trigger a false mismatch note.
     alpaca_note = ''
     try:
         r = _alpaca_get(f'{PAPER_BASE_URL}/v2/positions', headers=_headers())
         if r is not None:
+            tracked_symbols = _tracked_symbols(pos_state)
             tracked_legs = [p for p in r.json()
                             if p.get('asset_class') == 'us_option'
-                            and any(str(p.get('symbol', '')).startswith(t) for t in TICKERS)]
+                            and any(str(p.get('symbol', '')).startswith(t) for t in tracked_symbols)]
             alpaca_spreads = len(tracked_legs) // 2
             file_spreads   = len(real_pos)
             if alpaca_spreads != file_spreads:
