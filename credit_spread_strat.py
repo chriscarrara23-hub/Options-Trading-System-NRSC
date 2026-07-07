@@ -159,28 +159,60 @@ def _alpaca_get(url, **kwargs):
 # ── DATABASE ───────────────────────────────────────────────────────────────────
 
 _DB = None  # module-level psycopg2 connection
+_DB_LAST_ALERT_AT = None  # datetime of the last "DB unreachable" alert; None means no active failure
+DB_ALERT_REMINDER_INTERVAL = timedelta(hours=1)
 
 
 def _get_db():
     """Return a live psycopg2 connection, or None if DATABASE_URL is not set."""
-    global _DB
+    global _DB, _DB_LAST_ALERT_AT
     if not DATABASE_URL or psycopg2 is None:
         return None
     try:
         if _DB is None or _DB.closed:
             _DB = psycopg2.connect(DATABASE_URL)
+        if _DB_LAST_ALERT_AT is not None:
+            _DB_LAST_ALERT_AT = None
+            _discord('✅ DB reconnected — persistent storage active again')
         return _DB
     except Exception as e:
         print(f'[db] Connection failed: {e}')
         return None
 
 
+def _alert_db_unreachable():
+    """
+    Fire the DB-unreachable Discord alert immediately on first failure, then
+    re-fire at most once per DB_ALERT_REMINDER_INTERVAL for as long as the DB
+    stays unreachable (e.g. on later _load_weekly() calls during run_scan()).
+    Only called when DATABASE_URL is actually set — a deliberately DB-less
+    setup stays silent.
+    """
+    global _DB_LAST_ALERT_AT
+    now = datetime.now(ET)
+    if _DB_LAST_ALERT_AT is not None and (now - _DB_LAST_ALERT_AT) < DB_ALERT_REMINDER_INTERVAL:
+        return
+    first_alert = _DB_LAST_ALERT_AT is None
+    _DB_LAST_ALERT_AT = now
+    _discord(
+        ('🚨 DATABASE CONNECTION FAILED on startup — ' if first_alert else
+         '🚨 DATABASE STILL UNREACHABLE (reminder) — ') +
+        'DATABASE_URL is set but PostgreSQL is unreachable. Falling back to '
+        'ephemeral JSON storage — any open positions will not persist across '
+        'the next restart. '
+        "Check Railway's Postgres service and the DATABASE_URL variable on "
+        'this service immediately.'
+    )
+
+
 def _init_db():
     """Create tables if they don't exist. Logs connection on success."""
     conn = _get_db()
     if conn is None:
-        if DATABASE_URL and psycopg2 is None:
-            print('[db] WARNING — DATABASE_URL set but psycopg2 not installed; falling back to JSON')
+        if DATABASE_URL:
+            reason = 'psycopg2 not installed' if psycopg2 is None else 'connection failed (see [db] Connection failed log above)'
+            print(f'[db] WARNING — DATABASE_URL set but {reason}; falling back to JSON')
+            _alert_db_unreachable()
         return
     try:
         cur = conn.cursor()
@@ -528,6 +560,7 @@ def _load_weekly():
         if result is not None:
             return result
         print('[db] _load_weekly: DB unavailable, falling back to JSON')
+        _alert_db_unreachable()
     try:
         with open(WEEKLY_FILE) as f:
             d = json.load(f)
